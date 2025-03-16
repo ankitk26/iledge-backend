@@ -25,11 +25,11 @@ app = FastAPI()
 # This endpoint will not be used in the client. This is just for testing purpose
 @app.get("/transactions")
 def get_transactions(response: Response):
-    data = supabase.table("transactions").select("*").execute().data
+    data = supabase.table("transactions").select("id", count="exact").limit(1).execute()
     response.status_code = 200
     return {
         "status": "ok",
-        "message": f"Transactions fetched! Transaction count - {len(data)}",
+        "message": f"Transactions fetched! Transaction count - {data.count}",
     }
 
 
@@ -113,7 +113,7 @@ def populate_all_transactions(response: Response):
         supabase.rpc("truncate_and_reset").execute()
 
         # Process all transactions
-        is_inserts_done = process_transactions()
+        process_transactions(mail_df)
 
         response.status_code = 201
         return {
