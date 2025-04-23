@@ -80,7 +80,6 @@ def get_proper_iso_format(date_str):
         # Convert to datetime
         return datetime.fromisoformat(fixed_date_str)
     except (ValueError, IndexError) as e:
-        print(f"Error: {e}")
         return None
 
 
@@ -107,7 +106,10 @@ async def verify_session(session_token: Optional[str] = Cookie(None)):
     session = session_data.data[0]
     expiry_date = get_proper_iso_format(session["expires_at"])
 
-    # Check if session has expired
+    if expiry_date is None:
+        raise HTTPException(
+            status_code=500, detail="Could not parse session expiry date"
+        )
     if expiry_date < datetime.now():
         raise HTTPException(status_code=401, detail="Session expired")
 
@@ -135,16 +137,15 @@ async def verify_admin_session(user: dict = Depends(verify_session)):
     return user
 
 
-@app.get("/transactions")
-def get_transactions(response: Response, valid_user=Depends(verify_session)):
+@app.get("/expenses")
+def get_expenses(response: Response, valid_user=Depends(verify_session)):
     """
-    - Get all transactions from supabase
-    - Fetch all transactions from transactions table
+    - Get all expenses from supabase
     - This endpoint will not be used in the client. This is just for testing purpose
     """
 
     data = (
-        supabase.table("transactions")
+        supabase.table("expense")
         .select("id", "user_id", count="exact")
         .eq("user_id", valid_user["id"])
         .limit(1)
@@ -152,101 +153,102 @@ def get_transactions(response: Response, valid_user=Depends(verify_session)):
     )
 
     return api_response(
-        message=f"Transactions fetched! Transaction count - {data.count}",
+        message=f"Expenses fetched! Row count - {data.count}",
     )
 
 
-def process_transactions(user_id, mail_df=None):
+def process_expenses(user_id, mail_df=None):
     """
-    - Generic function to process transactions from the mails
-    - This can be used for fetching latest transactions or doing a full refresh
+    - Generic function to process expenses from the mails
+    - This can be used for fetching latest expenses or doing a full refresh
     """
 
     if mail_df is not None and mail_df.empty:
         return 0
 
-    # Select columns related to receiver
-    receiver_df = mail_df[["receiver_upi_id", "receiver_name", "transaction_date"]]
-
-    # Calculate rank for each receiver_upi_id based on recent transaction date. Recent transaction gets rank 1
-    receiver_df["rank"] = receiver_df.groupby("receiver_upi_id")[
-        "transaction_date"
-    ].rank(method="first", ascending=False)
+    # Select columns related to payee
+    payee_df = mail_df[["payee_upi_id", "payee_name", "transaction_date"]]
+    # Calculate rank for each payee_upi_id based on recent transaction date. Recent transaction gets rank 1
+    payee_df["rank"] = payee_df.groupby("payee_upi_id")["transaction_date"].rank(
+        method="first", ascending=False
+    )
 
     # Filter most recent names
-    eff_receiver_df = receiver_df[receiver_df["rank"] == 1]
+    eff_payee_df = payee_df[payee_df["rank"] == 1]
 
-    # Get list of new receivers to be added/updated
-    receiver_upi_ids = eff_receiver_df["receiver_upi_id"].tolist()
+    # Get list of new payees to be added/updated
+    payee_upi_ids = eff_payee_df["payee_upi_id"].tolist()
 
-    # Convert dataframe to list of tuples containing two values - receiver_id and name(receiver_name)
-    receiver_data = [
+    # Convert dataframe to list of tuples containing two values - payee_id and name(payee_name)
+    payee_data = [
         {
-            "receiver_upi_id": row.receiver_upi_id,
-            "name": row.receiver_name,
+            "payee_upi_id": row.payee_upi_id,
+            "name": row.payee_name,
             "user_id": user_id,
         }
-        for row in eff_receiver_df.itertuples(index=False)
+        for row in eff_payee_df.itertuples(index=False)
     ]
 
-    # Insert receivers into "receiver" table
-    # ON CONFLICT - this will update the name with the latest name if a receiver_upi is matched
-    supabase.table("receivers").upsert(
-        receiver_data, on_conflict="receiver_upi_id"
-    ).execute()
+    # Insert payees into "payee" table
+    # ON CONFLICT - this will update the name with the latest name if a payee_upi is matched
+    supabase.table("payee").upsert(payee_data, on_conflict="payee_upi_id").execute()
 
-    # Get list of all receivers upserted above
-    db_receiver_data = (
-        supabase.table("receivers")
-        .select("id, receiver_upi_id")
-        .in_("receiver_upi_id", receiver_upi_ids)
+    # Get list of all payees upserted above
+    db_payee_data = (
+        supabase.table("payee")
+        .select("id, payee_upi_id")
+        .in_("payee_upi_id", payee_upi_ids)
         .execute()
     )
 
-    # Create dictionary mapping each receiver_upi_id to each database ID
-    receiver_mapping = {
-        row["receiver_upi_id"]: row["id"] for row in db_receiver_data.data
-    }
+    # Create dictionary mapping each payee_upi_id to each database ID
+    payee_mapping = {row["payee_upi_id"]: row["id"] for row in db_payee_data.data}
 
-    # Prepare transactions data
-    transaction_records = [
+    # Prepare expense data
+    expense_records = [
         {
             "upi_ref_no": row.upi_ref_no,
             "amount": row.amount,
             "sender_upi_id": row.sender_upi_id,
-            "receiver_id": receiver_mapping.get(row.receiver_upi_id),
+            "payee_id": payee_mapping.get(row.payee_upi_id),
             "transaction_date": str(row.transaction_date),
             "user_id": user_id,
         }
         for _, row in mail_df.iterrows()
     ]
 
-    # Insert all transactions from mail_df
-    supabase.table("transactions").upsert(
-        transaction_records, on_conflict="upi_ref_no"
+    # Insert all expenses from mail_df
+    supabase.table("expense").upsert(
+        expense_records, on_conflict="upi_ref_no"
     ).execute()
 
 
-@app.post("/all-transactions")
-def populate_all_transactions(
+@app.post("/expenses")
+def populate_all_expenses(
     response: Response, admin_user: dict = Depends(verify_admin_session)
 ):
     """
-    Do full refresh of receivers and transactions tables
+    Do full refresh of payee and expenses tables
     """
     try:
         mail_ids = get_mail_ids()
+
         mail_data = get_parsed_emails(mail_ids)
+        if mail_data is None:
+            raise HTTPException(
+                status_code=400, detail="Error in processing emails. Please try again"
+            )
+
         mail_df = get_mail_dataframe(mail_data)
+        if mail_df is None:
+            raise HTTPException(
+                status_code=400, detail="Error in processing emails. Please try again"
+            )
 
         # Truncate data and reset identity in receivers and transactions tables
         supabase.rpc("truncate_and_reset").execute()
 
-        # Process all transactions
-        process_transactions(
-            mail_df=mail_df,
-            user_id=admin_user["id"],
-        )
+        process_expenses(mail_df=mail_df, user_id=admin_user["id"])
 
         response.status_code = 201
         return api_response(message="Full refresh done")
@@ -254,19 +256,17 @@ def populate_all_transactions(
         raise HTTPException(status_code=500, detail="Something went wrong")
 
 
-@app.post("/new-transactions")
-def add_new_transactions(
-    response: Response, valid_user: dict = Depends(verify_session)
-):
+@app.post("/expenses/new")
+def add_new_expenses(response: Response, valid_user: dict = Depends(verify_session)):
     """
-    Populate new transactions not present in supabase
+    Populate new expenses not present in supabase
     """
     try:
-        # Get transaction_date of the last transaction
         user_id = valid_user["id"]
 
+        # Get transaction_date of the last expense
         last_transaction_timestamp_data = (
-            supabase.table("transactions")
+            supabase.table("expense")
             .select("transaction_date", "user_id")
             .eq("user_id", user_id)
             .order("transaction_date", desc=True)
@@ -275,19 +275,17 @@ def add_new_transactions(
             .data
         )
 
-        # If no result is returned from above query, this means there are no transactions
-        # Hence use the other endpoint to do full load of all transactions
+        # If no result is returned from above query, this means there are no expenses
+        # Hence use the other endpoint to do full load of all expenses
         if len(last_transaction_timestamp_data) == 0:
             return api_response(
-                message="No transactions found. Please do a full refresh first"
+                message="No expenses found. Please do a full refresh first"
             )
 
-        # Extract timestamp
         last_transaction_timestamp = last_transaction_timestamp_data[0][
             "transaction_date"
         ]
 
-        # Extract date from timestamp
         last_transaction_date = datetime.fromisoformat(
             last_transaction_timestamp
         ).date()
@@ -296,9 +294,9 @@ def add_new_transactions(
         recent_mail_data = get_parsed_emails(recent_mail_ids)
         mail_df = get_mail_dataframe(recent_mail_data)
 
-        process_transactions(mail_df=mail_df, user_id=user_id)
+        process_expenses(mail_df=mail_df, user_id=user_id)
 
-        return api_response(message="Transactions upserted")
+        return api_response(message="expenses upserted")
 
     except Exception:
         raise HTTPException(status_code=500, detail="Something went wrong")
