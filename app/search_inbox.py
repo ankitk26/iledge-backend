@@ -1,6 +1,5 @@
 import imaplib
 import os
-import sys
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -18,7 +17,7 @@ CHECK_MAIL = os.getenv("CHECK_MAIL")
 def get_mail_connection():
     mail = imaplib.IMAP4_SSL(SMTP_SERVER, SMTP_PORT)
     mail.login(USER, PWD)
-    mail.select("INBOX", readonly=True)
+    mail.select('"[Gmail]/All Mail"', readonly=True)
     return mail
 
 
@@ -27,7 +26,7 @@ def get_mail_ids(latest_date: datetime = None):
     with get_mail_connection() as mail:
         search_query = ["FROM", f'"{CHECK_MAIL}"']
 
-        if latest_date:
+        if latest_date is not None:
             formatted_date = latest_date.strftime("%d-%b-%Y").upper()
             search_query.extend(["SINCE", formatted_date])
 
